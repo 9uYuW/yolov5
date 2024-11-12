@@ -5,6 +5,8 @@ YOLO-specific modules.
 Usage:
     $ python models/yolo.py --cfg yolov5s.yaml
 """
+import numpy as np
+
 '''======================1.导入安装好的python库====================='''
 import argparse
 import contextlib
@@ -33,6 +35,11 @@ from models.common import (
     C3TR,
     SPP,
     SPPF,
+    hswish,
+    SeModule,
+    InvertedResidualBlock,
+    DepthSeparableConv,
+    Add,
     Bottleneck,
     BottleneckCSP,
     C3Ghost,
@@ -49,7 +56,7 @@ from models.common import (
     Focus,
     GhostBottleneck,
     GhostConv,
-    Proto,
+    Proto, h_sigmoid, h_swish, SELayer, conv_bn_hswish, MobileNetV3,
 )
 from models.experimental import MixConv2d
 from utils.autoanchor import check_anchor_order
@@ -208,6 +215,8 @@ class BaseModel(nn.Module):
         # dt: 在profile中做性能评估时使用
         y, dt = [], []  # outputs
         for m in self.model:
+            # if isinstance(x, torch.Tensor):
+            #     print(x.shape)
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             # 测试该网络层的性能
@@ -315,9 +324,8 @@ class DetectionModel(BaseModel):
             def _forward(x):
                 """Passes the input 'x' through the model and returns the processed output."""
                 return self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
-
             # 定义一个256 * 256大小的输入（无实际意义，仅是为了模拟输入，测量stride）
-            s = 256  # 2x min stride
+            s = 320  # 2x min stride
             m.inplace = self.inplace
             # 将[1, ch, 256, 256]大小的tensor进行一次向前传播，得到3层的输出，用输入大小256分别除以输出大小得到每一层的下采样倍数stride
             m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
@@ -506,6 +514,8 @@ def parse_model(d, ch):
     """
     # 网络单元列表, 网络输出引用列表, 当前的输出通道数
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    inputsz = 320
+
     # 读取 backbone, head 中的网络单元
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
         # 利用 eval 函数, 读取 model 参数对应的类名 如‘Focus’,'Conv'等
@@ -538,6 +548,11 @@ def parse_model(d, ch):
             nn.ConvTranspose2d,
             DWConvTranspose2d,
             C3x,
+            h_sigmoid,
+            h_swish,
+            SELayer,
+            conv_bn_hswish,
+            MobileNetV3
         }:
             # c1: 当前层的输入channel数; c2: 当前层的输出channel数(初定); ch: 记录着所有层的输出channel数
             c1, c2 = ch[f], args[0]
@@ -561,6 +576,14 @@ def parse_model(d, ch):
                 args.insert(2, n)  # number of repeats
                 # 恢复默认值1
                 n = 1
+        elif m is InvertedResidualBlock:
+            c1 = ch[f]
+            c2 = args[1]
+            args = [c1, *args[0:]]
+        elif m is DepthSeparableConv:
+            c2 = args[0]
+            c1 = ch[f]
+            args = [c1, *args[0:]]
         # 判断是否是归一化模块
         elif m is nn.BatchNorm2d:
             # BN层只需要返回上一层的输出channel
@@ -569,10 +592,13 @@ def parse_model(d, ch):
         elif m is Concat:
             # Concat层则将f中所有的输出累加得到这层的输出channel
             c2 = sum(ch[x] for x in f)
+        elif m is Add:
+            c2 = ch[f[0]]
         # TODO: channel, gw, gd
         # 判断是否是detect模块
         elif m in {Detect, Segment}:
-            # 在args中加入三个Detect层的输出channel [nc, anchors, 128, 256, 512]
+            # 在args中加入三个Detect层的输出channel [nc, anchors, [128, 256, 512]]
+            # Segment [nc, anchors, 32, 256, [128, 256, 512]]
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)

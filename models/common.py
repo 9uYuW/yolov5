@@ -11,6 +11,7 @@ import zipfile
 from collections import OrderedDict, namedtuple
 from copy import copy
 from pathlib import Path
+from unittest.mock import inplace
 from urllib.parse import urlparse
 
 import cv2
@@ -160,6 +161,131 @@ class TransformerBlock(nn.Module):
         p = x.flatten(2).permute(2, 0, 1)
         return self.tr(p + self.linear(p)).permute(1, 2, 0).reshape(b, self.c2, w, h)
 
+class hswish(nn.Module):
+    def __init__(self, inplace: bool = False):
+        super(hswish, self).__init__()
+        self.sigmoid = HardSigmoid(inplace=inplace)
+
+    def forward(self, x):
+        return x * self.sigmoid
+
+class HardSigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(HardSigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+
+class SeModule(nn.Module):
+    def __init__(self, in_size, reduction=4):
+        super(SeModule, self).__init__()
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_size, in_size // reduction, kernel_size=1, stride=1, padding=0, bias=False),
+            # nn.BatchNorm2d(in_size // reduction),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_size // reduction, in_size, kernel_size=1, stride=1, padding=0, bias=False),
+            # nn.BatchNorm2d(in_size),
+            HardSigmoid()
+        )
+
+    def forward(self, x):
+        return x * self.se(x)
+
+class InvertedResidualBlock(nn.Module):
+    '''expand + depthwise + pointwise'''
+    def __init__(self, in_size, expand_size, out_size, kernel_size, stride, af, se):
+        super(InvertedResidualBlock, self).__init__()
+        self.stride = stride
+        self.in_size = in_size
+        self.out_size = out_size
+        self.se = None
+        if se is not None:
+            self.se = se(expand_size)
+
+        # 扩展卷积
+        self.conv1 = nn.Conv2d(in_size, expand_size, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn1 = nn.BatchNorm2d(expand_size)
+        self.af1 = af(inplace=True)
+
+        # 深度卷积
+        self.conv2 = nn.Conv2d(expand_size, expand_size, kernel_size=kernel_size, stride=stride,
+                               padding=kernel_size // 2, groups=expand_size, bias=False)
+        self.bn2 = nn.BatchNorm2d(expand_size)
+        self.af2 = af(inplace=True)
+
+        # 逐点卷积
+        self.conv3 = nn.Conv2d(expand_size, out_size, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_size)
+
+        self.shortcut = nn.Sequential()
+
+    def forward(self, x):
+        out = self.af1(self.bn1(self.conv1(x)))
+
+        if self.stride == 2:
+            out = torch.nn.functional.avg_pool2d(out, 2, 1, 0, False, True)  ####
+
+        # out = out
+        out = self.af2(self.bn2(self.conv2(out)))
+        if self.se is not None:
+            out = self.se(out)
+        out = self.bn3(self.conv3(out))
+
+        out = out + self.shortcut(x) if (self.in_size == self.out_size and self.stride == 1) else out
+        return out
+
+class DepthSeparableConv(nn.Module):
+    '''depthwise + pointwise'''
+    def __init__(self, in_channel, out_channel, kernel_size, stride, af, se):
+        super(DepthSeparableConv, self).__init__()
+        self.stride = stride
+        self.in_channel = in_channel
+        self.out_channel = out_channel
+        self.se = se
+
+        self.depthConv = nn.Sequential(
+            nn.Conv2d(in_channel, in_channel, kernel_size=kernel_size, stride=stride, padding=kernel_size // 2,
+                               groups=in_channel, bias=False),
+            nn.BatchNorm2d(in_channel),
+            af(inplace=True)
+        )
+
+        self.pointConv = nn.Sequential(
+            nn.Conv2d(in_channel, out_channel, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(out_channel)
+        )
+
+        self.shortcut = nn.Sequential()
+        # if stride == 1 and in_size != out_size:
+        #     self.shortcut = nn.Sequential(
+        #         nn.Conv2d(in_size, out_size, kernel_size=1, stride=1, padding=0, bias=False),
+        #         nn.BatchNorm2d(out_size),
+        #     )
+
+    def forward(self, x):
+        # out = self.nolinear1(self.bn1(self.conv1(x)))
+        out = self.depthConv(x)
+        if self.se != None:
+            out = self.se(out)
+        out = self.pointConv(out)
+
+        out = out + self.shortcut(x) if self.in_channel == self.out_channel else out
+        return out
+
+class Add(nn.Module):
+    """Concatenates tensors along a specified dimension for efficient tensor manipulation in neural networks."""
+
+    def __init__(self):
+        """Initializes a Concat module to concatenate tensors along a specified dimension."""
+        super().__init__()
+
+    def forward(self, x):
+        """Concatenates a list of tensors along a specified dimension; `x` is a list of tensors, `dimension` is an
+        int.
+        """
+        return x[0] + x[1]
 
 class Bottleneck(nn.Module):
     """A bottleneck layer with optional shortcut and group convolution for efficient feature extraction."""
@@ -206,6 +332,119 @@ class BottleneckCSP(nn.Module):
         y2 = self.cv2(x)
         return self.cv4(self.act(self.bn(torch.cat((y1, y2), 1))))
 
+
+# Mobilenetv3Small
+# ——————MobileNetV3——————
+
+class h_sigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_sigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+
+
+class h_swish(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_swish, self).__init__()
+        self.sigmoid = h_sigmoid(inplace=inplace)
+
+    def forward(self, x):
+        return x * self.sigmoid(x)
+
+
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=4):
+        super(SELayer, self).__init__()
+        # Squeeze操作
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # Excitation操作(FC+ReLU+FC+Sigmoid)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel),
+            h_sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x)
+        y = y.view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)  # 学习到的每一channel的权重
+        return x * y
+
+
+class conv_bn_hswish(nn.Module):
+    """
+    This equals to
+    def conv_3x3_bn(inp, oup, stride):
+        return nn.Sequential(
+            nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
+            nn.BatchNorm2d(oup),
+            h_swish()
+        )
+    """
+
+    def __init__(self, c1, c2, stride):
+        super(conv_bn_hswish, self).__init__()
+        self.conv = nn.Conv2d(c1, c2, 3, stride, 1, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = h_swish()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+    def fuseforward(self, x):
+        return self.act(self.conv(x))
+
+
+class MobileNetV3(nn.Module):
+    def __init__(self, inp, oup, hidden_dim, kernel_size, stride, use_se, use_hs):
+        super(MobileNetV3, self).__init__()
+        assert stride in [1, 2]
+
+        self.identity = stride == 1 and inp == oup
+
+        # 输入通道数=扩张通道数 则不进行通道扩张
+        if inp == hidden_dim:
+            self.conv = nn.Sequential(
+                # dw
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, (kernel_size - 1) // 2, groups=hidden_dim,
+                          bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                h_swish() if use_hs else nn.ReLU(inplace=True),
+                # Squeeze-and-Excite
+                SELayer(hidden_dim) if use_se else nn.Sequential(),
+                # pw-linear
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup),
+            )
+        else:
+            # 否则 先进行通道扩张
+            self.conv = nn.Sequential(
+                # pw
+                nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                h_swish() if use_hs else nn.ReLU(inplace=True),
+                # dw
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, (kernel_size - 1) // 2, groups=hidden_dim,
+                          bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                # Squeeze-and-Excite
+                SELayer(hidden_dim) if use_se else nn.Sequential(),
+                h_swish() if use_hs else nn.ReLU(inplace=True),
+                # pw-linear
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup),
+            )
+
+    def forward(self, x):
+        y = self.conv(x)
+        if self.identity:
+            return x + y
+        else:
+            return y
 
 class CrossConv(nn.Module):
     """Implements a cross convolution layer with downsampling, expansion, and optional shortcut."""
